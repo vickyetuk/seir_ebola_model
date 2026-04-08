@@ -1,0 +1,339 @@
+---
+title: 'Simulated Ebola Outbreak Model '
+author: "Victoria Etuk"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+#First, I loaded all required libraries:
+#tidyverse for data manipulation
+#incidence package for estimating incidence of cases from dates
+#EpiEstim for estimating R0 and Re
+#outbreaks package for simulated datasets
+#deSolve for solving deterministic models
+#adaptivetau for solving stochastic models
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(incidence)
+library(EpiEstim)
+library(outbreaks)
+library(deSolve)
+library(adaptivetau)
+library(shiny)
+```
+
+## The Data
+Step 1: I imported the data from the preloaded datasets in the outbreaks package. I used the str code to view the structure of the data.
+
+```{r load_data}
+case_data <- outbreaks::ebola_sim$linelist
+str(case_data)
+```
+#The dataset has multiple date variables (columns), but only one is complete with no 'NA'. To avoid having to drop data, I use the date_of_onset variable, as it is most complete.
+#I arrange it from earliest to latest, using the column date of onset
+```{r reverse dates}
+case_data <- case_data %>% arrange(date_of_onset)
+```
+
+#To get the dates as an incidence, we convert it to an incidence object
+
+```{r incidence object}
+i <- case_data$date_of_onset %>% incidence()
+i
+plot(i)
+```
+
+#I fitted the data to get the predicted incidence till the last date
+
+```{r incidence fit}
+my_fit <- fit(i)
+plot(i)
+plot(my_fit)
+```
+#To estimate R0 and Re, we need the serial interval for the disease. The estimated serial interval  for Ebola is 15.3, with standard deviation of 9.1 
+(WHO Ebola Response Team et al. “Ebola virus disease in West Africa--the first 9 months of the epidemic and forward projections.” The New England journal of medicine vol. 371,16 (2014): 1481-95. doi:10.1056/NEJMoa1411100)
+
+```{r serial interval}
+serial_interval <- make_config(
+  mean_si = 15.3,
+  std_si = 9.1)
+```
+
+
+Estimating and plotting R0 and Re: We select the first value of R as R0, as that is the earliest estimate at the start of the outbreak. The estimated R0 is 4.038 (the earliest R estimated at day 10).
+
+```{r estimating R0 and Re}
+my_R0 <- estimate_R(i,method="parametric_si",config=serial_interval)
+
+plot(my_R0, what = "R", legend = TRUE, 
+                 options_R = list(col = "red", xlab = "Date"))
+as_tibble(my_R0$R)
+```
+
+Fitting the model. 
+
+The model assumptions and parameters are as follows:
+
+The model assumptions are as follows: 
+1. There is no vertical transmission of the infection from mother to baby. 
+2. The outbreak occurs in an entirely susceptible population, with no previous 
+natural or acquired immunity.  
+3. The model does not account for births and deaths as the outbreak occurred in a 
+short period, so natural birth rates and death rates are negligible and not 
+included. 
+4. All susceptible individuals have equal chance of being exposed and infected 
+(homogenuous mixing). 
+5. Exposed asymptomatic individuals are not infectious.  
+6. A person is infectious as long as and only when they are symptomatic, which is 
+within ~14 days15. 
+7. The duration of infectiousness is same for both individuals who recover and who 
+die, thus the same recovery rate applies to both recovery and death 
+compartments. 
+8. Acquired immunity in recovered individuals is perfect and life-long. 
+9. There is no available treatment or cure for the disease. 
+10. Death rates from the disease applies only to cases, i.e. only in infected individuals 
+11. There is no vertical transmission of the infection from mother to baby. 
+
+Compartments: Based on the assumptions above, five compartments were 
+developed 
+1. Susceptible 
+2. Exposed 
+3. Infectious 
+4. Recovered 
+5. Dead 
+
+Rate of change equations for the SEIRD model:
+
+The model equations are as below:
+
+$\Delta S=-\beta SI$
+
+$\Delta E= \beta SI- \alpha E$
+
+$\Delta I= \alpha E -\gamma I$
+
+$\Delta R=\gamma I(1-p)$
+
+$\Delta D= \gamma Ip$
+
+####Define parameters.
+Parameter Estimate 
+α= 1/incubation period=1/21 days= 0.047  [Source: World Health Organisation (WHO). Ebola disease. https://www.who.int/news-room/factsheets/detail/ebola-disease (2025)] 
+
+γ=1/duration of infectiousness=1/14 days=0.0714 [Source:Velásquez, Gustavo E et al. “Time From Infection to Disease and Infectiousness for Ebola Virus Disease, a Systematic Review.” Clinical infectious diseases : an official publication of the Infectious Diseases Society of America vol. 61,7 (2015):1135-40. doi:10.1093/cid/civ531]
+
+β= Estimated as R0 * γ0= 4.038*0.0714= 0.288 
+
+p= Case Fatality Rate of Ebola=0.613 [Source:Izudi J, Bajunirwe F. Case fatality rate for Ebola disease, 1976-2022: A meta-analysis of global data. J Infect Public Health. 2024 Jan;17(1):25-34.doi: 10.1016/j.jiph.2023.10.020. Epub 2023 Oct 27. PMID: 37992431. 16]
+
+#I included the parameters as a list, they should appear in the order they appear in the equation
+
+```{r define parameters}
+parameters <- c(beta = 0.288, gamma = 0.0714, alpha = 0.047, p=0.613)
+parameters
+```
+
+#Define initial values
+
+I included the values of $S$,  $E$, $I$, $R$ and $D$ as proportions and estimated what they would be at the start of the epidemic. The values must sum up to 1 as they are proportions. 
+I assumed a population of 10,000 people and only one infectious person, thus $I=0.0001$ and $S=1-I=0.9999$. There are no immune individuals and the only exposed person is the current infected person, thus $E$ and $R$ =0 I also assume that no deaths have occurred, so $D$ is also 0.
+```{r define initial values}
+initial_values <- c(S = 0.9999,
+                    E=0,
+                    I=0.0001,
+                    R = 0,
+                    D=0)
+initial_values
+```
+
+#The model equations are written in as a function in R
+```{r model equations}
+baseSEIRmodel <- function(t, state, parameters){
+  with(as.list(c(state, parameters)),{
+    
+    # Rate of change equations
+    dS <- -beta*S*I
+    dE <- beta*S*I- alpha*E
+    dI <- alpha*E - gamma*I
+    dR <- gamma*I*(1-p)
+    dD <- gamma*I*(p)
+    
+    # Combine rates of change into a list
+    list(c(dS, dE, dI, dR, dD))
+  })
+}
+
+```
+
+#I defined a time sequence of 1 year i.e. 365 days for which I want the model to estimate. This can be varied as needed
+```{r times}
+times <- seq(0, 365, by = 1)
+```
+
+#Deterministic models are based on an ordinary differential equation, as typically diseases spread in an exponential function. The function includes the initial values, the times, the model function and the parameters.
+
+```{r run model}
+model_output <- ode(y = initial_values,
+           times = times,
+           func = baseSEIRmodel,
+           parms = parameters)
+```
+
+
+#I put the results as a data frame in tibble format
+```{r tibble}
+model_output <- as_tibble(data.frame(model_output))
+model_output
+```
+
+
+#Summary statistics for the model
+```{r summary statistics}
+model_output %>% summarise(maxI = max(I), minS = min(S), maxE= max (E), maxR = max(R))
+
+model_output %>% summarise(lastI = last(I), lastS = last(S), lastE= last(E),lastR = last(R))
+
+```
+
+#Plotting the model. The gather function is used to get the key compartments in to the plot
+
+```{r model plot}
+model_plot <- model_output %>% gather(key = compartment, value = value, c("S", "E", "I", "R", "D"))
+model_plot %>% mutate(compartment = fct_relevel(compartment, 
+                                        "S", "E", "I", "R", "D")) %>%
+        ggplot(aes(x = time, y = value, group = compartment)) +
+        geom_line(aes(color = compartment,
+                      ),
+                      linewidth = 1) +
+        scale_color_manual(values = c("green",
+                                      "purple",
+                                      "black",
+                                      "darkgrey",
+                                      "darkred"
+                                      )) +
+        theme_minimal(base_size = 12) +
+        labs(x = "time (days)",
+             y = "proportion",
+             title = "Simulated SEIRD model for 365 days of an Ebola Outbreak",
+             subtitle = "beta = 0.288, gamma = 0.0714, alpha = 0.047, p=0.613",
+             color = "")
+model_plot
+
+
+print (model_plot)
+```
+Based on the model, the time to the peak of the outbreak is about 170 days, with no treatments or quarantine, and would affect about 12.5% of the entire population.
+
+
+#I then converted the SEIRD model to a shiny app, an interactive dashboard where different outbreak scenarios can be simulated by varying the different parameters
+```{r shiny app}
+# 1. Define the UI
+ui <- fluidPage(
+  titlePanel("Ebola Outbreak Simulator (SEIRD Model)"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      h4("Transmission Parameters"),
+      sliderInput("beta", "Transmission Rate (beta):", 
+                  min = 0, max = 1, value = 0.288, step = 0.01),
+      sliderInput("alpha", "Incubation Rate (alpha):", 
+                  min = 0.01, max = 0.5, value = 0.047, step = 0.001),
+      sliderInput("gamma", "Recovery/Removal Rate (gamma):", 
+                  min = 0.01, max = 0.5, value = 0.0714, step = 0.001),
+      
+      hr(),
+      h4("Disease Severity"),
+      sliderInput("p", "Case Fatality Rate (CFR):", 
+                  min = 0, max = 1, value = 0.613, step = 0.01),
+      
+      hr(),
+      h4("Simulation Settings"),
+      sliderInput("days", "Days to Simulate:", 
+                  min = 10, max = 1000, value = 400, step = 5)
+    ),
+    
+    mainPanel(
+      plotOutput("seirPlot", height = "500px"),
+      br(),
+      wellPanel(
+        h4("Summary Statistics"),
+        tableOutput("statTable")
+      )
+    )
+  )
+)
+
+# 2. Define the Server Logic
+server <- function(input, output) {
+  
+  # The SEIRD Model Function
+  baseSEIRmodel <- function(t, state, parameters) {
+    with(as.list(c(state, parameters)), {
+      dS <- -beta * S * I
+      dE <-  beta * S * I - alpha * E
+      dI <-  alpha * E - gamma * I
+      
+      # Using p as the CFR
+      dR <-  gamma * I * (1 - p)
+      dD <-  gamma * I * p
+      
+      # Order must be S, E, I, R, D
+      return(list(c(dS, dE, dI, dR, dD)))
+    })
+  }
+  
+  # Reactive Calculation
+  model_data <- reactive({
+    parameters <- c(beta = input$beta, 
+                    gamma = input$gamma, 
+                    alpha = input$alpha, 
+                    p = input$p)
+    
+    initial_values <- c(S = 0.9999, E = 0, I = 0.0001, R = 0, D = 0)
+    times <- seq(0, input$days, by = 1)
+    
+    out <- ode(y = initial_values, times = times, func = baseSEIRmodel, parms = parameters)
+    as.data.frame(out)
+  })
+  
+  # Render the Plot
+  output$seirPlot <- renderPlot({
+    df <- model_data()
+    
+    df_long <- df %>%
+      pivot_longer(cols = c(S, E, I, R, D), names_to = "Compartment", values_to = "Proportion")
+    
+    ggplot(df_long, aes(x = time, y = Proportion, color = Compartment)) +
+      geom_line(size = 1.2) +
+      scale_color_manual(values = c("S"="#9b59b6", "E"="#f1c40f", "I"="#2ecc71", "R"="#3498db", "D"="#e74c3c")) +
+      labs(title = "Epidemic Projection", x = "Days", y = "Proportion of Population") +
+      theme_minimal(base_size = 16) +
+      theme(legend.position = "bottom")
+  })
+  
+  # Render Summary Table
+  output$statTable <- renderTable({
+    df <- model_data()
+    final_row <- tail(df, 1)
+    
+    data.frame(
+      Metric = c("Basic Reproduction Number (R0)", "Peak Infected Proportion", "Total Survival (R)", "Total Deceased (D)"),
+      Value = c(
+        input$beta / input$gamma,
+        max(df$I),
+        final_row$R,
+        final_row$D
+      )
+    )
+  }, digits = 4)
+}
+
+# 3. Launch
+shinyApp(ui = ui, server = server)
+
+```
